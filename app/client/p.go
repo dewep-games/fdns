@@ -3,12 +3,12 @@
  *  Use of this source code is governed by a BSD 3-Clause license that can be found in the LICENSE file.
  */
 
-package api
+package client
 
 import (
 	"go.osspkg.com/goppy/v2/plugins"
 )
 
 var Plugins = plugins.Inject(
-	NewApi,
+	New,
 )

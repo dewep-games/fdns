@@ -1,5 +1,6 @@
+
 run:
-  go: "1.22.5"
+  go: "1.22"
   concurrency: 4
   timeout: 5m
   tests: false
@@ -206,7 +207,6 @@ linters:
     - errorlint
     - bodyclose
     - exportloopref
-    - gci
     - gosec
     - lll
   fast: false

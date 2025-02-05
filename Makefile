@@ -1,10 +1,10 @@
 
+SHELL=/bin/bash
+
+
 .PHONY: install
 install:
 	go install go.osspkg.com/goppy/v2/cmd/goppy@latest
-
-.PHONY: setup
-setup:
 	goppy setup-lib
 
 .PHONY: lint
@@ -23,11 +23,11 @@ build:
 tests:
 	goppy test
 
-.PHONY: pre-commite
-pre-commite: setup lint build tests
+.PHONY: pre-commit
+pre-commit: install license lint tests build
 
 .PHONY: ci
-ci: install setup lint build tests
+ci: pre-commit
 
 run_back:
 	go run cmd/fdns/main.go --config=config/config.dev.yaml

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2020-2024 Mikhail Knyazhev <markus621@yandex.com>. All rights reserved.
+ *  Copyright (c) 2020-2025 Mikhail Knyazhev <markus621@yandex.com>. All rights reserved.
  *  Use of this source code is governed by a BSD 3-Clause license that can be found in the LICENSE file.
  */
 
@@ -11,18 +11,18 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/osspkg/fdns/app/db"
-	"go.osspkg.com/algorithms/filters/bloom"
-	"go.osspkg.com/encrypt/hash"
+	"go.osspkg.com/algorithms/structs/bloom"
 	"go.osspkg.com/goppy/v2/orm"
 	"go.osspkg.com/goppy/v2/web"
 	"go.osspkg.com/logx"
 	"go.osspkg.com/routine"
-	"go.osspkg.com/syncing"
 	"go.osspkg.com/validate"
 	"go.osspkg.com/xc"
+
+	"github.com/osspkg/fdns/app/db"
 )
 
 const (
@@ -35,46 +35,43 @@ var rex = regexp.MustCompile(`(?miU)^\|\|([a-z0-9-.]+)\^(\n|\r|\$)`)
 type AdBlock struct {
 	bloom *bloom.Bloom
 	cli   *web.ClientHttp
-	db    db.Connect
-	mux   syncing.Lock
+	db    db.DB
+	mux   sync.RWMutex
 }
 
-func NewAdBlock(dbc db.Connect, cli web.ClientHttpPool) (*AdBlock, error) {
-	ab := &AdBlock{
+func NewAdBlock(dbc db.DB, cli web.ClientHttpPool) *AdBlock {
+	return &AdBlock{
 		cli: cli.Create(),
 		db:  dbc,
-		mux: syncing.NewLock(),
 	}
-	var err error
-	if ab.bloom, err = ab.createBloom(10_000_000); err != nil {
-		return nil, err
-	}
-	return ab, nil
 }
 
-func (v *AdBlock) createBloom(size uint64) (bf *bloom.Bloom, err error) {
-	for i := 0; i < 10; i++ {
-		bf, err = bloom.New(size*2, 0.0001)
-		if err != nil {
-			continue
-		}
-		return bf, nil
-	}
-	return
+func (v *AdBlock) createBloom(size uint64) (*bloom.Bloom, error) {
+	return bloom.New(
+		bloom.Quantity(size*2, 0.0001),
+	)
 }
 
 func (v *AdBlock) Up(ctx xc.Context) error {
-	if err := v.ForceUpdate(ctx.Context()); err != nil {
-		logx.Error("AdBlock update", "err", err)
+	var err error
+
+	if v.bloom, err = v.createBloom(10_000); err != nil {
+		return fmt.Errorf("create bloom: %w", err)
 	}
-	go routine.Interval(ctx.Context(), time.Hour*24, func(ctx context.Context) {
-		if err := v.UpgradeRules(ctx); err != nil {
-			logx.Error("AdBlock update", "err", err)
+
+	if err = v.Reload(ctx.Context()); err != nil {
+		logx.Error("AdBlock reload", "err", err)
+	}
+
+	go routine.Interval(ctx.Context(), time.Hour*6, func(ctx context.Context) {
+		if e := v.Upgrade(ctx); e != nil {
+			logx.Error("AdBlock reload", "err", e)
 		}
-		if err := v.ForceUpdate(ctx); err != nil {
-			logx.Error("AdBlock update", "err", err)
+		if e := v.Reload(ctx); e != nil {
+			logx.Error("AdBlock update", "err", e)
 		}
 	})
+
 	return nil
 }
 
@@ -82,22 +79,21 @@ func (v *AdBlock) Down() error {
 	return nil
 }
 
-func (v *AdBlock) UpgradeRules(ctx context.Context) error {
+func (v *AdBlock) Upgrade(ctx context.Context) error {
 	list := make(map[uint64]string, 10)
-	err := v.db.Main().Query(ctx, "get_adblock_list", func(q orm.Querier) {
-		q.SQL(
-			"SELECT `id`,`data` FROM `blacklist_adblock_list` WHERE `deleted_at` IS NULL AND `type` = ?;",
+	err := v.db.Slave().Query(ctx, "get_adblock_list", func(q orm.Querier) {
+		q.SQL(`SELECT "id", "url" FROM "black_list" WHERE "deleted_at" IS NULL AND "type" = $1`,
 			AdBlockDynamic,
 		)
 		q.Bind(func(bind orm.Scanner) error {
 			var (
-				id   uint64
-				data string
+				id  uint64
+				url string
 			)
-			if err := bind.Scan(&id, &data); err != nil {
+			if err := bind.Scan(&id, &url); err != nil {
 				return err
 			}
-			list[id] = data
+			list[id] = url
 			return nil
 		})
 	})
@@ -106,11 +102,11 @@ func (v *AdBlock) UpgradeRules(ctx context.Context) error {
 	}
 
 	for id, uri := range list {
-		count, err := func() (int, error) {
+		var count int
+		count, err = func() (int, error) {
 			var b []byte
-			err0 := v.cli.Call(ctx, http.MethodGet, uri, nil, &b)
-			if err0 != nil {
-				return 0, err0
+			if e := v.cli.Call(ctx, http.MethodGet, uri, nil, &b); e != nil {
+				return 0, e
 			}
 
 			rexResult := rex.FindAll(b, -1)
@@ -121,16 +117,16 @@ func (v *AdBlock) UpgradeRules(ctx context.Context) error {
 
 				result = append(result, rule)
 				if len(result) == 100 {
-					if err0 = v.save(ctx, id, result); err0 != nil {
-						return 0, err0
+					if e := v.save(ctx, id, result); e != nil {
+						return 0, e
 					}
 					result = result[:0]
 				}
 			}
 
 			if len(result) > 0 {
-				if err0 = v.save(ctx, id, result); err0 != nil {
-					return 0, err0
+				if e := v.save(ctx, id, result); e != nil {
+					return 0, e
 				}
 			}
 
@@ -147,20 +143,23 @@ func (v *AdBlock) UpgradeRules(ctx context.Context) error {
 }
 
 func (v *AdBlock) save(ctx context.Context, id uint64, data []string) error {
-	return v.db.Main().Tx(ctx, "save_adblock_rules", func(v orm.Tx) {
+	return v.db.Master().Tx(ctx, "save_adblock_rules", func(v orm.Tx) {
 		v.Exec(func(e orm.Executor) {
-			e.SQL("INSERT IGNORE INTO `blacklist_adblock_rules` (`list_id`, `data`, `hash`, `updated_at`) VALUES (?, ?, ?, now());")
+			e.SQL(`INSERT INTO "black_list_rules" ("list_id", "data", "created_at", "updated_at")
+							VALUES ($1, $2, now(), now()) ON CONFLICT ("data") DO NOTHING;`)
 			for _, datum := range data {
-				e.Params(id, datum, hash.SHA1(datum))
+				e.Params(id, datum)
 			}
 		})
 	})
 }
 
-func (v *AdBlock) ForceUpdate(ctx context.Context) error {
+func (v *AdBlock) Reload(ctx context.Context) error {
 	count := 0
-	err := v.db.Main().Query(ctx, "count_adblock_rules", func(q orm.Querier) {
-		q.SQL("SELECT COUNT(*) FROM `blacklist_adblock_rules` WHERE `deleted_at` IS NULL;")
+	err := v.db.Slave().Query(ctx, "count_adblock_rules", func(q orm.Querier) {
+		q.SQL(`SELECT COUNT(blr."id") FROM "black_list_rules" blr
+                		LEFT JOIN "black_list" bl on bl."id" = blr."list_id"
+                		WHERE bl."deleted_at" IS NULL AND blr."deleted_at" IS NULL;`)
 		q.Bind(func(bind orm.Scanner) error {
 			return bind.Scan(&count)
 		})
@@ -177,8 +176,10 @@ func (v *AdBlock) ForceUpdate(ctx context.Context) error {
 		return err
 	}
 
-	err = v.db.Main().Query(ctx, "load_adblock_rules", func(q orm.Querier) {
-		q.SQL("SELECT `data` FROM `blacklist_adblock_rules` WHERE `deleted_at` IS NULL;")
+	err = v.db.Slave().Query(ctx, "load_adblock_rules", func(q orm.Querier) {
+		q.SQL(`SELECT blr."data" FROM "black_list_rules" blr
+                		LEFT JOIN "black_list" bl on bl."id" = blr."list_id"
+                		WHERE bl."deleted_at" IS NULL AND blr."deleted_at" IS NULL;`)
 		q.Bind(func(bind orm.Scanner) error {
 			var data string
 			if err0 := bind.Scan(&data); err0 != nil {
@@ -192,36 +193,37 @@ func (v *AdBlock) ForceUpdate(ctx context.Context) error {
 		return err
 	}
 
-	v.mux.Lock(func() {
-		v.bloom = bf
-	})
+	v.mux.Lock()
+	v.bloom = bf
+	v.mux.Unlock()
 
 	return nil
 }
 
 func (v *AdBlock) Contain(name string) bool {
 	has := false
+
 	levels := validate.CountDomainLevels(name)
 	params := make([]interface{}, 0, levels)
+
+	v.mux.RLock()
 	for i := validate.CountDomainLevels(name); i >= 1; i-- {
 		subDomain := validate.GetDomainLevel(name, i)
 		params = append(params, subDomain)
-		v.mux.RLock(func() {
-			has = has || v.bloom.Contain([]byte(subDomain))
-		})
+		has = has || v.bloom.Contain([]byte(subDomain))
 	}
+	v.mux.Unlock()
+
 	if !has || len(params) == 0 {
 		return false
 	}
 
 	count := 0
-	err := v.db.Main().Query(context.Background(), "get_one_adblock_rule", func(q orm.Querier) {
-		q.SQL(
-			fmt.Sprintf(
-				"SELECT COUNT(*) FROM `blacklist_adblock_rules` WHERE `deleted_at` IS NULL AND `data` IN (%s);",
-				strings.Trim(strings.Repeat("?,", len(params)), ","),
-			),
-			params...,
+	err := v.db.Slave().Query(context.Background(), "get_one_adblock_rule", func(q orm.Querier) {
+		q.SQL(`SELECT COUNT(blr."id") FROM "black_list_rules" blr
+                		LEFT JOIN "black_list" bl on bl."id" = blr."list_id"
+                		WHERE bl."deleted_at" IS NULL AND blr."deleted_at" IS NULL AND blr."data" = ANY($1);`,
+			params,
 		)
 		q.Bind(func(bind orm.Scanner) error {
 			return bind.Scan(&count)

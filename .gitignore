@@ -12,9 +12,7 @@
 *.db-journal
 *.mmdb
 .env
-
-
-
+*.dev.yaml
 
 .angulardoc.json
 coverage.txt

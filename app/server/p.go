@@ -3,12 +3,19 @@
  *  Use of this source code is governed by a BSD 3-Clause license that can be found in the LICENSE file.
  */
 
-package api
+package server
 
 import (
 	"go.osspkg.com/goppy/v2/plugins"
+	"go.osspkg.com/goppy/v2/xdns"
 )
 
 var Plugins = plugins.Inject(
-	NewApi,
+	New,
+	plugins.Plugin{
+		Inject: func(ds *xdns.Server, s *Server) error {
+			ds.HandleFunc(s)
+			return nil
+		},
+	},
 )
